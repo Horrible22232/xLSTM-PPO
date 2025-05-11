@@ -66,6 +66,8 @@ class PPOTrainer:
             self.recurrent_cell = hxs
         elif self.recurrence["layer_type"] == "lstm":
             self.recurrent_cell = (hxs, cxs)
+        elif self.recurrence["layer_type"] == "xlstm":
+            self.recurrent_cell = (hxs, cxs)  # For xLSTM, hxs is mLSTM state and cxs is sLSTM state
 
         # Reset workers (i.e. environments)
         print("Step 5: Reset workers")
@@ -134,13 +136,16 @@ class PPOTrainer:
         for t in range(self.config["worker_steps"]):
             # Gradients can be omitted for sampling training data
             with torch.no_grad():
-                # Save the initial observations and recurrentl cell states
+                # Save the initial observations and recurrent cell states
                 self.buffer.obs[:, t] = torch.tensor(self.obs)
                 if self.recurrence["layer_type"] == "gru":
                     self.buffer.hxs[:, t] = self.recurrent_cell.squeeze(0)
                 elif self.recurrence["layer_type"] == "lstm":
                     self.buffer.hxs[:, t] = self.recurrent_cell[0].squeeze(0)
                     self.buffer.cxs[:, t] = self.recurrent_cell[1].squeeze(0)
+                elif self.recurrence["layer_type"] == "xlstm":
+                    self.buffer.mxs[:, t] = self.recurrent_cell[0].squeeze(0)  # mLSTM state
+                    self.buffer.sxs[:, t] = self.recurrent_cell[1].squeeze(0)  # sLSTM state
 
                 # Forward the model to retrieve the policy, the states' value and the recurrent cell states
                 policy, value, self.recurrent_cell = self.model(torch.tensor(self.obs), self.recurrent_cell, self.device)
@@ -179,6 +184,9 @@ class PPOTrainer:
                         elif self.recurrence["layer_type"] == "lstm":
                             self.recurrent_cell[0][:, w] = hxs
                             self.recurrent_cell[1][:, w] = cxs
+                        elif self.recurrence["layer_type"] == "xlstm":
+                            self.recurrent_cell[0][:, w] = hxs  # mLSTM state
+                            self.recurrent_cell[1][:, w] = cxs  # sLSTM state
                 # Store latest observations
                 self.obs[w] = obs
                             
@@ -223,44 +231,63 @@ class PPOTrainer:
             recurrent_cell = samples["hxs"].unsqueeze(0)
         elif self.recurrence["layer_type"] == "lstm":
             recurrent_cell = (samples["hxs"].unsqueeze(0), samples["cxs"].unsqueeze(0))
+        elif self.recurrence["layer_type"] == "xlstm":
+            recurrent_cell = (samples["mxs"].unsqueeze(0), samples["sxs"].unsqueeze(0))
 
         # Forward model
         policy, value, _ = self.model(samples["obs"], recurrent_cell, self.device, self.buffer.actual_sequence_length)
         
+        loss_mask = samples["loss_mask"]
+
         # Policy Loss
-        # Retrieve and process log_probs from each policy branch
-        log_probs, entropies = [], []
+        # Retrieve and process log_probs from each policy branch (still padded at this stage)
+        log_probs_new, entropies_new = [], []
         for i, policy_branch in enumerate(policy):
-            log_probs.append(policy_branch.log_prob(samples["actions"][:, i]))
-            entropies.append(policy_branch.entropy())
-        log_probs = torch.stack(log_probs, dim=1)
-        entropies = torch.stack(entropies, dim=1).sum(1).reshape(-1)
+            log_probs_new.append(policy_branch.log_prob(samples["actions"][:, i]))
+            entropies_new.append(policy_branch.entropy())
+        log_probs_new = torch.stack(log_probs_new, dim=1)
+        entropies_new = torch.stack(entropies_new, dim=1).sum(1).reshape(-1)
         
-        # Remove paddings
-        value = value[samples["loss_mask"]]
-        log_probs = log_probs[samples["loss_mask"]]
-        entropies = entropies[samples["loss_mask"]] 
+        # Apply mask to model outputs and relevant buffer data
+        value_new_masked = value[loss_mask]
+        log_probs_new_masked = log_probs_new[loss_mask]
+        entropies_new_masked = entropies_new[loss_mask]
+
+        advantages_masked = samples["advantages"][loss_mask]
+        log_probs_old_masked = samples["log_probs"][loss_mask]
+        values_old_masked = samples["values"][loss_mask]
 
         # Compute policy surrogates to establish the policy loss
-        normalized_advantage = (samples["advantages"] - samples["advantages"].mean()) / (samples["advantages"].std() + 1e-8)
-        normalized_advantage = normalized_advantage.unsqueeze(1).repeat(1, len(self.action_space_shape)) # Repeat is necessary for multi-discrete action spaces
-        ratio = torch.exp(log_probs - samples["log_probs"])
+        # Ensure advantages are normalized only over unpadded steps
+        normalized_advantage = (advantages_masked - advantages_masked.mean()) / (advantages_masked.std() + 1e-8)
+        # normalized_advantage needs to be unsqueezed to match shape of log_probs for element-wise multiplication
+        if normalized_advantage.dim() == 1: # (num_unpadded_steps)
+             normalized_advantage = normalized_advantage.unsqueeze(1) # (num_unpadded_steps, 1)
+        # If log_probs_old_masked has multiple action dimensions, ensure normalized_advantage is repeated
+        if log_probs_old_masked.dim() > 1 and log_probs_old_masked.shape[1] > 1 and normalized_advantage.shape[1] == 1:
+            normalized_advantage = normalized_advantage.repeat(1, log_probs_old_masked.shape[1])
+
+        ratio = torch.exp(log_probs_new_masked - log_probs_old_masked)
         surr1 = ratio * normalized_advantage
         surr2 = torch.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * normalized_advantage
         policy_loss = torch.min(surr1, surr2)
-        policy_loss = policy_loss.mean()
+        policy_loss = -policy_loss.mean() # PPO minimizes the negative of the objective
 
-        # Value  function loss
-        sampled_return = samples["values"] + samples["advantages"]
-        clipped_value = samples["values"] + (value - samples["values"]).clamp(min=-clip_range, max=clip_range)
-        vf_loss = torch.max((value - sampled_return) ** 2, (clipped_value - sampled_return) ** 2)
+        # Value function loss
+        sampled_return_masked = values_old_masked + advantages_masked # Target for value function
+        # Clipped value prediction
+        clipped_value_prediction = values_old_masked + (value_new_masked - values_old_masked).clamp(min=-clip_range, max=clip_range)
+        
+        vf_loss1 = (value_new_masked - sampled_return_masked) ** 2
+        vf_loss2 = (clipped_value_prediction - sampled_return_masked) ** 2
+        vf_loss = torch.max(vf_loss1, vf_loss2)
         vf_loss = vf_loss.mean()
 
         # Entropy Bonus
-        entropy_bonus = entropies.mean()
+        entropy_bonus = entropies_new_masked.mean()
 
         # Complete loss
-        loss = -(policy_loss - self.config["value_loss_coefficient"] * vf_loss + beta * entropy_bonus)
+        loss = policy_loss + self.config["value_loss_coefficient"] * vf_loss - beta * entropy_bonus
 
         # Compute gradients
         for pg in self.optimizer.param_groups:
