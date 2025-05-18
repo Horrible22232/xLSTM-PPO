@@ -10,6 +10,15 @@ from docopt import docopt
 from model import ActorCriticModel
 from utils import create_env
 import imageio
+import gymnasium as gym
+
+def get_action_space_shape(action_space):
+    if isinstance(action_space, gym.spaces.Discrete):
+        return (action_space.n,)
+    elif isinstance(action_space, gym.spaces.MultiDiscrete):
+        return tuple(action_space.nvec)
+    else:
+        raise NotImplementedError("Action space type not supported")
 
 def main():
     # Command line arguments via docopt
@@ -34,7 +43,7 @@ def main():
     env = create_env(config["env"])
 
     # Initialize model and load its parameters
-    model = ActorCriticModel(config, env.observation_space, (env.action_space.n,))
+    model = ActorCriticModel(config, env.observation_space, get_action_space_shape(env.action_space))
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()

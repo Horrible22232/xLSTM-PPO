@@ -35,6 +35,7 @@ class MemoryGymWrapper():
         self._env = gym.make(env_name, disable_env_checker = True, render_mode = render_mode)
 
         self._realtime_mode = realtime_mode
+        self._rewards = []
 
         self._observation_space = spaces.Box(
                 low = 0,
@@ -81,6 +82,7 @@ class MemoryGymWrapper():
         vis_obs = np.swapaxes(vis_obs, 0, 2)
         vis_obs = np.swapaxes(vis_obs, 2, 1)
 
+        self._rewards = []
         return vis_obs
 
     def step(self, action):
@@ -101,7 +103,11 @@ class MemoryGymWrapper():
         vis_obs, reward, done, truncation, info = self._env.step(action)
         vis_obs = np.swapaxes(vis_obs, 0, 2)
         vis_obs = np.swapaxes(vis_obs, 2, 1)
-
+        self._rewards.append(reward)
+        if done or truncation:
+            info = {"reward": sum(self._rewards), "length": len(self._rewards)}
+        else:
+            info = None
         return vis_obs, reward, done, info
     
     def render(self):

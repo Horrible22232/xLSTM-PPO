@@ -11,6 +11,7 @@ from utils import create_env
 from utils import polynomial_decay
 from collections import deque
 from torch.utils.tensorboard import SummaryWriter
+import gymnasium as gym
 
 class PPOTrainer:
     def __init__(self, config:dict, run_id:str="run", device:torch.device=torch.device("cpu")) -> None:
@@ -40,7 +41,7 @@ class PPOTrainer:
         print("Step 1: Init dummy environment")
         dummy_env = create_env(self.config["environment"])
         self.observation_space = dummy_env.observation_space
-        self.action_space_shape = (dummy_env.action_space.n,)
+        self.action_space_shape = get_action_space_shape(dummy_env.action_space)
         dummy_env.close()
 
         # Init buffer
@@ -371,3 +372,11 @@ class PPOTrainer:
 
         time.sleep(1.0)
         exit(0)
+
+def get_action_space_shape(action_space):
+    if isinstance(action_space, gym.spaces.Discrete):
+        return (action_space.n,)
+    elif isinstance(action_space, gym.spaces.MultiDiscrete):
+        return tuple(action_space.nvec)
+    else:
+        raise NotImplementedError("Action space type not supported")

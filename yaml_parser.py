@@ -15,7 +15,7 @@ class YamlParser:
             path {str} -- Yaml file path to the to be loaded config file.
         """
         # Load the config file
-        stream = open(path, "r")
+        stream = open(path, "r", encoding="utf-8")
         yaml = YAML()
         yaml_args = yaml.load_all(stream)
         
