@@ -32,8 +32,8 @@ class Buffer():
         self.hxs = torch.zeros((self.n_workers, self.worker_steps, hidden_state_size), dtype=torch.float32)
         self.cxs = torch.zeros((self.n_workers, self.worker_steps, hidden_state_size), dtype=torch.float32)
         if self.layer_type == "xlstm":
-            self.mxs = torch.zeros((self.n_workers, self.worker_steps, hidden_state_size), dtype=torch.float32)
-            self.sxs = torch.zeros((self.n_workers, self.worker_steps, hidden_state_size), dtype=torch.float32)
+            # store full sLSTM state: (num_states=4, hidden)
+            self.xlstm_states = torch.zeros((self.n_workers, self.worker_steps, 4, hidden_state_size), dtype=torch.float32)
         self.log_probs = torch.zeros((self.n_workers, self.worker_steps, len(action_space_shape)), dtype=torch.float32)
         self.values = torch.zeros((self.n_workers, self.worker_steps), dtype=torch.float32)
         self.advantages = torch.zeros((self.n_workers, self.worker_steps), dtype=torch.float32)
@@ -50,8 +50,7 @@ class Buffer():
         }
         
         if self.layer_type == "xlstm":
-            samples["mxs"] = self.mxs
-            samples["sxs"] = self.sxs
+            samples["xlstm_states"] = self.xlstm_states
         else:
             samples["hxs"] = self.hxs
             if self.layer_type == "lstm":
@@ -91,8 +90,7 @@ class Buffer():
                     
                     # Initial recurrent states for this sequence (from the start of the sequence)
                     if self.layer_type == "xlstm":
-                        seq_data["mxs"] = self.mxs[w, buffer_seq_start:buffer_seq_start+1] # Take first step state
-                        seq_data["sxs"] = self.sxs[w, buffer_seq_start:buffer_seq_start+1]
+                        seq_data["xlstm_states"] = self.xlstm_states[w, buffer_seq_start:buffer_seq_start+1]
                     else:
                         seq_data["hxs"] = self.hxs[w, buffer_seq_start:buffer_seq_start+1]
                         if self.layer_type == "lstm":
@@ -125,26 +123,26 @@ class Buffer():
             # Consider how to handle this: maybe skip epoch, or ensure dummy data that doesn't break downstream.
 
         self.samples_flat = {}
-        if sequences: 
-            all_keys = sequences[0].keys() if sequences[0] else [] 
+        if sequences:
+            all_keys = sequences[0].keys() if sequences[0] else []
             if not all_keys:
                 print("\n!!! DEBUG: sequences[0] has no keys (even though sequences list is not empty)!")
 
             for key in all_keys:
-                list_to_cat = [] 
+                list_to_cat = []
                 try:
                     list_to_cat = [s[key] for s in sequences]
-                    if key in ["hxs", "cxs", "mxs", "sxs"]: 
+                    if key in ["hxs", "cxs", "xlstm_states"]:
                         self.samples_flat[key] = torch.cat(list_to_cat, dim=0).squeeze(1)
-                    else: 
+                    else:
                         self.samples_flat[key] = torch.cat(list_to_cat, dim=0)
                 except TypeError as te:
                     print(f"\n!!! TypeError during torch.cat for key='{key}': {te}")
-                    for i, item_in_list in enumerate(list_to_cat): 
+                    for i, item_in_list in enumerate(list_to_cat):
                         print(f"    Item {i} in list for key '{key}': type={type(item_in_list)}")
                         if hasattr(item_in_list, 'dtype'):
                             print(f"        dtype: {item_in_list.dtype}")
-                    raise te 
+                    raise te
                 except Exception as e:
                     print(f"\n!!! UNEXPECTED ERROR during torch.cat for key='{key}': {e}")
                     for i, item_in_list in enumerate(list_to_cat):
@@ -196,7 +194,7 @@ class Buffer():
             mini_batch_padded_indices = indices[sequence_indices[start:end]].reshape(-1)
             mini_batch = {}
             for key, value in self.samples_flat.items():
-                if key in ["hxs", "cxs", "mxs", "sxs"]:
+                if key in ["hxs", "cxs", "xlstm_states"]:
                     # Select recurrent cell states of sequence starts
                     mini_batch[key] = value[sequence_indices[start:end]].to(self.device)
                 else:

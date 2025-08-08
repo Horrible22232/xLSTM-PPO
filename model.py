@@ -4,70 +4,71 @@ from torch import nn
 from torch.distributions import Categorical
 from torch.nn import functional as F
 
-class xLSTMBlock(nn.Module):
-    def __init__(self, input_size, hidden_size, num_heads=4):
+from xlstm.xlstm_block_stack import xLSTMBlockStack, xLSTMBlockStackConfig
+from xlstm.blocks.slstm.block import sLSTMBlockConfig
+from xlstm.blocks.slstm.layer import sLSTMLayerConfig
+from typing import Optional, Tuple, Dict
+
+
+class RLxLSTM(nn.Module):
+    """Wrapper around the repository's xLSTM to support RL recurrent usage.
+
+    We use a single sLSTM block with conv1d disabled (kernel_size=0) so the
+    recurrent state consists solely of the sLSTM state tensors.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4, dropout: float = 0.0):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        
-        # mLSTM components
-        self.mlstm_qkv = nn.Linear(input_size, 3 * input_size)
-        
-        # sLSTM components
-        self.slstm_qkv = nn.Linear(hidden_size, 3 * hidden_size)
-        self.slstm_proj = nn.Linear(hidden_size, hidden_size)
-        
-        # Gating mechanisms
-        self.mlstm_gate = nn.Linear(2 * hidden_size, hidden_size) # Input is cat(x_proj, h_s), both hidden_size 
-        self.slstm_gate = nn.Linear(2 * hidden_size, hidden_size) # Input is cat(h_s_candidate, h_m), both hidden_size
-        
-        # Layer normalization
-        self.norm_h_m = nn.LayerNorm(hidden_size)
-        self.norm_h_s = nn.LayerNorm(hidden_size)
-        
-    def forward(self, x, h_m, h_s):
-        # x shape: (batch, seq, input_size)
-        # h_m shape: (batch, seq, hidden_size) - assuming after transpose
-        # h_s shape: (batch, seq, hidden_size) - assuming after transpose
 
-        # mLSTM path
-        qkv_m = self.mlstm_qkv(x) 
-        q_m, k_m, v_m = qkv_m.chunk(3, dim=-1)
-        # attn_weights_m = torch.sigmoid(q_m * k_m) # Original test logic had this
+        self.input_proj = nn.Identity() if input_size == hidden_size else nn.Linear(input_size, hidden_size)
 
-        # sLSTM path
-        qkv_s = self.slstm_qkv(h_s) 
-        q_s, k_s, v_s = qkv_s.chunk(3, dim=-1)
-        attn_weights_s = torch.sigmoid(q_s * k_s) 
-        h_s_candidate = attn_weights_s * v_s 
+        slstm_layer_cfg = sLSTMLayerConfig(
+            embedding_dim=hidden_size,
+            num_heads=num_heads,
+            conv1d_kernel_size=0,  # disable conv state to simplify external state handling
+            dropout=dropout,
+            backend="vanilla",
+        )
+        slstm_block_cfg = sLSTMBlockConfig(slstm=slstm_layer_cfg, feedforward=None)
 
-        # Revised gating and updates for dimensional correctness
-        if self.input_size != self.hidden_size:
-            if not hasattr(self, 'input_to_hidden_proj') or self.input_to_hidden_proj.weight.device != x.device:
-                # print(f"DEBUG: Creating/Recreating input_to_hidden_proj on device: {x.device}")
-                self.input_to_hidden_proj = nn.Linear(self.input_size, self.hidden_size).to(x.device)
-            x_proj = self.input_to_hidden_proj(x)
-        else:
-            x_proj = x
+        stack_cfg = xLSTMBlockStackConfig(
+            mlstm_block=None,
+            slstm_block=slstm_block_cfg,
+            context_length=-1,
+            num_blocks=1,
+            embedding_dim=hidden_size,
+            add_post_blocks_norm=True,
+            bias=False,
+            dropout=dropout,
+            slstm_at="all",
+        )
+        self.stack = xLSTMBlockStack(config=stack_cfg)
 
-        # h_s update (influenced by its own path and h_m)
-        # The slstm_gate takes h_s_candidate and x (or h_m)
-        # Let's use h_m as per a common LSTM/GRU cross-influence pattern
-        gate_s_input = torch.cat([h_s_candidate, h_m], dim=-1) 
-        gate_s = torch.sigmoid(self.slstm_gate(gate_s_input)) 
-        h_s = gate_s * h_s_candidate + (1 - gate_s) * h_m # h_m influences h_s. h_s gets updated first.
+    @torch.no_grad()
+    def init_state(self, batch_size: int, device: torch.device, dtype: torch.dtype = torch.float32) -> Dict[str, Dict[str, torch.Tensor]]:
+        # sLSTMCellConfig default num_states is 4
+        slstm_state = torch.zeros((4, batch_size, self.hidden_size), dtype=dtype, device=device)
+        # conv_state is not used when conv1d_kernel_size=0
+        return {"block_0": {"slstm_state": slstm_state}}
 
-        # h_m update (influenced by x_proj and the new h_s)
-        gate_m_input = torch.cat([x_proj, h_s], dim=-1) # h_s is new, x_proj is current input projected
-        gate_m = torch.sigmoid(self.mlstm_gate(gate_m_input)) 
-        
-        h_m = gate_m * x_proj + (1 - gate_m) * h_m # Reverted to direct assignment
-        
-        h_m = self.norm_h_m(h_m)
-        h_s = self.norm_h_s(h_s)
-        
-        return h_m, h_s
+    def step(self, x: torch.Tensor, state: Optional[Dict[str, Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, Dict[str, Dict[str, torch.Tensor]]]:
+        # x: (B, 1, input_size)
+        x_proj = self.input_proj(x)
+        y, state = self.stack.step(x_proj, state=state)
+        return y, state
+
+    def forward_sequence(self, x: torch.Tensor, state: Optional[Dict[str, Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, Dict[str, Dict[str, torch.Tensor]]]:
+        # x: (B, S, input_size); step through to respect provided initial state
+        B, S, _ = x.shape
+        outputs = []
+        cur_state = state
+        for t in range(S):
+            y_t, cur_state = self.step(x[:, t : t + 1, :], cur_state)
+            outputs.append(y_t)
+        y = torch.cat(outputs, dim=1)
+        return y, cur_state
 
 class ActorCriticModel(nn.Module):
     def __init__(self, config, observation_space, action_space_shape):
@@ -106,7 +107,12 @@ class ActorCriticModel(nn.Module):
         elif self.recurrence["layer_type"] == "lstm":
             self.recurrent_layer = nn.LSTM(in_features_next_layer, self.recurrence["hidden_state_size"], batch_first=True)
         elif self.recurrence["layer_type"] == "xlstm":
-            self.recurrent_layer = xLSTMBlock(in_features_next_layer, self.recurrence["hidden_state_size"])
+            self.recurrent_layer = RLxLSTM(
+                input_size=in_features_next_layer,
+                hidden_size=self.recurrence["hidden_state_size"],
+                num_heads=4,
+                dropout=0.0,
+            )
         # Init recurrent layer
         if self.recurrence["layer_type"] != "xlstm":
             for name, param in self.recurrent_layer.named_parameters():
@@ -170,21 +176,9 @@ class ActorCriticModel(nn.Module):
         if sequence_length == 1:
             # Case: sampling training data or model optimization using sequence length == 1
             if self.recurrence["layer_type"] == "xlstm":
-                h_m_in_orig, h_s_in_orig = recurrent_cell # (1, batch_size, hidden_size)
-                
-                x_for_block = h.unsqueeze(1) # (batch_size, 1, input_size)
-                
-                # Transpose h_m, h_s to (batch_size, 1, hidden_size) for xLSTMBlock
-                h_m_for_block = h_m_in_orig.transpose(0, 1)
-                h_s_for_block = h_s_in_orig.transpose(0, 1)
-                
-                h_m_out_block, h_s_out_block = self.recurrent_layer(x_for_block, h_m_for_block, h_s_for_block)
-                # h_m_out_block, h_s_out_block are (batch_size, 1, hidden_size)
-                
-                h = h_s_out_block.squeeze(1)  # Use sLSTM output as main state for subsequent layers
-                
-                # Store back into recurrent_cell in original format (1, batch_size, hidden_size)
-                recurrent_cell = (h_m_out_block.transpose(0, 1), h_s_out_block.transpose(0, 1))
+                x_step = h.unsqueeze(1)
+                y, recurrent_cell = self.recurrent_layer.step(x_step, state=recurrent_cell)
+                h = y.squeeze(1)
             else:
                 h, recurrent_cell = self.recurrent_layer(h.unsqueeze(1), recurrent_cell)
                 h = h.squeeze(1)  # Remove sequence length dimension
@@ -196,23 +190,15 @@ class ActorCriticModel(nn.Module):
 
             # Forward recurrent layer
             if self.recurrence["layer_type"] == "xlstm":
-                h_m_initial, h_s_initial = recurrent_cell
-                
-                # Transpose to (num_actor_sequences, 1, hidden_size)
-                h_m_t = h_m_initial.transpose(0,1) 
-                h_s_t = h_s_initial.transpose(0,1)
-
-                outputs_s = []
-                # Manual unrolling over the sequence
-                for t in range(sequence_length):
-                    x_t = h[:, t, :].unsqueeze(1) # (num_actor_sequences, 1, num_features)
-                    h_m_t, h_s_t = self.recurrent_layer(x_t, h_m_t, h_s_t) # h_m_t, h_s_t are (num_actor_sequences, 1, hidden_size)
-                    outputs_s.append(h_s_t) # Store the s_state for each step
-                
-                h = torch.cat(outputs_s, dim=1) # (num_actor_sequences, sequence_length, hidden_size)
-                
-                # Final recurrent_cell should be the last step's states, transposed back
-                recurrent_cell = (h_m_t.transpose(0,1), h_s_t.transpose(0,1))
+                # recurrent_cell is expected to be a list of per-sequence state dicts
+                num_sequences = h.shape[0]
+                outputs = []
+                for seq_idx in range(num_sequences):
+                    y_seq, _ = self.recurrent_layer.forward_sequence(
+                        h[seq_idx : seq_idx + 1], state=recurrent_cell[seq_idx]
+                    )
+                    outputs.append(y_seq)
+                h = torch.cat(outputs, dim=0)
             else: # GRU or LSTM
                 # These layers handle batch_first=True and initial hidden states correctly.
                 h, recurrent_cell = self.recurrent_layer(h, recurrent_cell)
@@ -266,8 +252,10 @@ class ActorCriticModel(nn.Module):
         if self.recurrence["layer_type"] == "gru":
             hxs = torch.zeros((1, num_sequences, self.recurrence["hidden_state_size"]), dtype=torch.float32, device=device)
             return hxs, None
-        elif self.recurrence["layer_type"] == "lstm" or self.recurrence["layer_type"] == "xlstm":
-            # For xLSTM, hxs will be m_state, cxs will be s_state. Both are hidden_size.
+        elif self.recurrence["layer_type"] == "lstm":
             hxs = torch.zeros((1, num_sequences, self.recurrence["hidden_state_size"]), dtype=torch.float32, device=device)
             cxs = torch.zeros((1, num_sequences, self.recurrence["hidden_state_size"]), dtype=torch.float32, device=device)
             return hxs, cxs
+        elif self.recurrence["layer_type"] == "xlstm":
+            # Return xLSTM state dict for the whole batch
+            return self.recurrent_layer.init_state(batch_size=num_sequences, device=device), None

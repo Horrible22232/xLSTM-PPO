@@ -61,14 +61,15 @@ class PPOTrainer:
         # Setup observation placeholder   
         self.obs = np.zeros((self.config["n_workers"],) + self.observation_space.shape, dtype=np.float32)
 
-        # Setup initial recurrent cell states (LSTM: tuple(tensor, tensor) or GRU: tensor)
+        # Setup initial recurrent cell states
         hxs, cxs = self.model.init_recurrent_cell_states(self.config["n_workers"], self.device)
         if self.recurrence["layer_type"] == "gru":
             self.recurrent_cell = hxs
         elif self.recurrence["layer_type"] == "lstm":
             self.recurrent_cell = (hxs, cxs)
         elif self.recurrence["layer_type"] == "xlstm":
-            self.recurrent_cell = (hxs, cxs)  # For xLSTM, hxs is mLSTM state and cxs is sLSTM state
+            # state dict returned by model for batch
+            self.recurrent_cell = hxs
 
         # Reset workers (i.e. environments)
         print("Step 5: Reset workers")
@@ -145,8 +146,10 @@ class PPOTrainer:
                     self.buffer.hxs[:, t] = self.recurrent_cell[0].squeeze(0)
                     self.buffer.cxs[:, t] = self.recurrent_cell[1].squeeze(0)
                 elif self.recurrence["layer_type"] == "xlstm":
-                    self.buffer.mxs[:, t] = self.recurrent_cell[0].squeeze(0)  # mLSTM state
-                    self.buffer.sxs[:, t] = self.recurrent_cell[1].squeeze(0)  # sLSTM state
+                    # store full per-worker state tensors into buffer
+                    # model keeps state as dict keyed by block; take block_0 -> slstm_state (4, B, H)
+                    slstm_state = self.recurrent_cell["block_0"]["slstm_state"]  # (4, B, H)
+                    self.buffer.xlstm_states[:, t] = slstm_state.permute(1, 0, 2)
 
                 # Forward the model to retrieve the policy, the states' value and the recurrent cell states
                 policy, value, self.recurrent_cell = self.model(torch.tensor(self.obs), self.recurrent_cell, self.device)
@@ -186,8 +189,19 @@ class PPOTrainer:
                             self.recurrent_cell[0][:, w] = hxs
                             self.recurrent_cell[1][:, w] = cxs
                         elif self.recurrence["layer_type"] == "xlstm":
-                            self.recurrent_cell[0][:, w] = hxs  # mLSTM state
-                            self.recurrent_cell[1][:, w] = cxs  # sLSTM state
+                            # replace only this worker's state in dict
+                            for block_key in list(self.recurrent_cell.keys()):
+                                block_state = self.recurrent_cell.get(block_key, {})
+                                new_block_state = hxs.get(block_key, {})  # hxs is a state dict returned for batch_size=1
+                                for state_key, tensor in list(block_state.items()):
+                                    # skip None states (e.g., conv_state when conv1d disabled)
+                                    new_slice = new_block_state.get(state_key, None)
+                                    if tensor is None or new_slice is None:
+                                        continue
+                                    # tensor shape (num_states, B, H), new_slice shape (num_states, 1, H)
+                                    updated = tensor.clone()
+                                    updated[:, w : w + 1, :] = new_slice
+                                    self.recurrent_cell[block_key][state_key] = updated
                 # Store latest observations
                 self.obs[w] = obs
                             
@@ -233,9 +247,20 @@ class PPOTrainer:
         elif self.recurrence["layer_type"] == "lstm":
             recurrent_cell = (samples["hxs"].unsqueeze(0), samples["cxs"].unsqueeze(0))
         elif self.recurrence["layer_type"] == "xlstm":
-            recurrent_cell = (samples["mxs"].unsqueeze(0), samples["sxs"].unsqueeze(0))
+            # converted above; leave placeholder for clarity
+            pass
 
         # Forward model
+        # For xLSTM, we expect xlstm_states of shape (num_sequences, 4, H). Turn into list of dicts per sequence
+        if self.recurrence["layer_type"] == "xlstm":
+            seq_states = []
+            states_tensor = samples["xlstm_states"]  # (num_sequences, 4, H)
+            num_sequences = states_tensor.shape[0]
+            for i in range(num_sequences):
+                # expand to include batch dim=1: (4, 1, H)
+                slstm_state = states_tensor[i].unsqueeze(1)
+                seq_states.append({"block_0": {"slstm_state": slstm_state}})
+            recurrent_cell = seq_states
         policy, value, _ = self.model(samples["obs"], recurrent_cell, self.device, self.buffer.actual_sequence_length)
         
         loss_mask = samples["loss_mask"]
