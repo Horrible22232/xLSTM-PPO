@@ -10,10 +10,10 @@ from xlstm.blocks.slstm.layer import sLSTMLayerConfig
 from typing import Optional, Tuple, Dict
 
 
-class RLxLSTM(nn.Module):
-    """Wrapper around the repository's xLSTM to support RL recurrent usage.
+class xLSTM(nn.Module):
+    """xLSTM recurrent module adapted for RL usage.
 
-    We use a single sLSTM block with conv1d disabled (kernel_size=0) so the
+    Uses a single sLSTM block with conv1d disabled (kernel_size=0) so the
     recurrent state consists solely of the sLSTM state tensors.
     """
 
@@ -140,7 +140,7 @@ class ActorCriticModel(nn.Module):
             self.recurrent_layer = nn.LSTM(in_features_next_layer, self.recurrence["hidden_state_size"], batch_first=True)
         elif self.recurrence["layer_type"] == "xlstm":
             xlstm_backend = self.recurrence.get("xlstm_backend", "cuda" if torch.cuda.is_available() else "vanilla")
-            self.recurrent_layer = RLxLSTM(
+            self.recurrent_layer = xLSTM(
                 input_size=in_features_next_layer,
                 hidden_size=self.recurrence["hidden_state_size"],
                 num_heads=4,
