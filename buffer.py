@@ -1,5 +1,6 @@
 from gymnasium import spaces
 import torch
+from typing import Generator, Dict
 # import numpy as np # No longer needed if all are tensors
 
 class Buffer():
@@ -170,7 +171,7 @@ class Buffer():
             self.true_sequence_length = float(self.actual_sequence_length)
         # print(f"Buffer: True sequence length (avg): {self.true_sequence_length}, Padded sequence length: {self.actual_sequence_length}") -- Removed
 
-    def recurrent_mini_batch_generator(self) -> dict:
+    def recurrent_mini_batch_generator(self) -> Generator[Dict[str, torch.Tensor], None, None]:
         """A recurrent generator that returns a dictionary containing the data of a whole minibatch.
         In comparison to the none-recurrent one, this generator maintains the sequences of the workers' experience trajectories.
         

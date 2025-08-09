@@ -397,20 +397,21 @@ class PPOTrainer:
 
     def close(self) -> None:
         """Terminates the trainer and all related processes."""
-        try:
-            self.dummy_env.close()
-        except:
-            pass
+        if hasattr(self, "dummy_env") and self.dummy_env is not None:
+            try:
+                self.dummy_env.close()
+            except Exception:
+                pass
 
         try:
             self.writer.close()
-        except:
+        except Exception:
             pass
 
         try:
             for worker in self.workers:
                 worker.child.send(("close", None))
-        except:
+        except Exception:
             pass
 
         time.sleep(1.0)
