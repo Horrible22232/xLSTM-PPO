@@ -17,10 +17,11 @@ class RLxLSTM(nn.Module):
     recurrent state consists solely of the sLSTM state tensors.
     """
 
-    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4, dropout: float = 0.0):
+    def __init__(self, input_size: int, hidden_size: int, num_heads: int = 4, dropout: float = 0.0, backend: str = "vanilla"):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.backend = backend
 
         self.input_proj = nn.Identity() if input_size == hidden_size else nn.Linear(input_size, hidden_size)
 
@@ -29,7 +30,7 @@ class RLxLSTM(nn.Module):
             num_heads=num_heads,
             conv1d_kernel_size=0,  # disable conv state to simplify external state handling
             dropout=dropout,
-            backend="vanilla",
+            backend=backend,
         )
         slstm_block_cfg = sLSTMBlockConfig(slstm=slstm_layer_cfg, feedforward=None)
 
@@ -59,16 +60,47 @@ class RLxLSTM(nn.Module):
         y, state = self.stack.step(x_proj, state=state)
         return y, state
 
-    def forward_sequence(self, x: torch.Tensor, state: Optional[Dict[str, Dict[str, torch.Tensor]]]) -> Tuple[torch.Tensor, Dict[str, Dict[str, torch.Tensor]]]:
-        # x: (B, S, input_size); step through to respect provided initial state
+    def forward_sequence(self, x: torch.Tensor, state: Optional[Dict[str, Dict[str, torch.Tensor]] | list]) -> Tuple[torch.Tensor, Dict[str, Dict[str, torch.Tensor]] | list]:
+        # x: (B, S, input_size); supports state as dict (batched) or list of per-sequence dicts
         B, S, _ = x.shape
+
+        # If state is a list of per-sequence dicts, merge into a single batched dict
+        def _merge_state(state_list: list[Dict[str, Dict[str, torch.Tensor]]]) -> Dict[str, Dict[str, torch.Tensor]]:
+            merged: Dict[str, Dict[str, torch.Tensor]] = {}
+            for block_key in state_list[0].keys():
+                merged[block_key] = {}
+                for state_key in state_list[0][block_key].keys():
+                    tensors = [sd[block_key][state_key] for sd in state_list if sd[block_key][state_key] is not None]
+                    if len(tensors) == 0:
+                        merged[block_key][state_key] = None
+                    else:
+                        merged[block_key][state_key] = torch.cat(tensors, dim=1)  # (num_states, B, H)
+            return merged
+
+        def _split_state(merged_state: Dict[str, Dict[str, torch.Tensor]]) -> list[Dict[str, Dict[str, torch.Tensor]]]:
+            out: list[Dict[str, Dict[str, torch.Tensor]]] = []
+            for b in range(B):
+                d: Dict[str, Dict[str, torch.Tensor]] = {}
+                for block_key, block_state in merged_state.items():
+                    d[block_key] = {}
+                    for state_key, tensor in block_state.items():
+                        if tensor is None:
+                            d[block_key][state_key] = None
+                        else:
+                            d[block_key][state_key] = tensor[:, b : b + 1, :].contiguous()
+                out.append(d)
+            return out
+
+        batched_state = _merge_state(state) if isinstance(state, list) else state
+
         outputs = []
-        cur_state = state
+        cur_state = batched_state
         for t in range(S):
             y_t, cur_state = self.step(x[:, t : t + 1, :], cur_state)
             outputs.append(y_t)
         y = torch.cat(outputs, dim=1)
-        return y, cur_state
+
+        return y, (_split_state(cur_state) if isinstance(state, list) else cur_state)
 
 class ActorCriticModel(nn.Module):
     def __init__(self, config, observation_space, action_space_shape):
@@ -107,11 +139,13 @@ class ActorCriticModel(nn.Module):
         elif self.recurrence["layer_type"] == "lstm":
             self.recurrent_layer = nn.LSTM(in_features_next_layer, self.recurrence["hidden_state_size"], batch_first=True)
         elif self.recurrence["layer_type"] == "xlstm":
+            xlstm_backend = self.recurrence.get("xlstm_backend", "cuda" if torch.cuda.is_available() else "vanilla")
             self.recurrent_layer = RLxLSTM(
                 input_size=in_features_next_layer,
                 hidden_size=self.recurrence["hidden_state_size"],
                 num_heads=4,
                 dropout=0.0,
+                backend=xlstm_backend,
             )
         # Init recurrent layer
         if self.recurrence["layer_type"] != "xlstm":
@@ -190,15 +224,8 @@ class ActorCriticModel(nn.Module):
 
             # Forward recurrent layer
             if self.recurrence["layer_type"] == "xlstm":
-                # recurrent_cell is expected to be a list of per-sequence state dicts
-                num_sequences = h.shape[0]
-                outputs = []
-                for seq_idx in range(num_sequences):
-                    y_seq, _ = self.recurrent_layer.forward_sequence(
-                        h[seq_idx : seq_idx + 1], state=recurrent_cell[seq_idx]
-                    )
-                    outputs.append(y_seq)
-                h = torch.cat(outputs, dim=0)
+                # Batched forward over all sequences; accepts list of per-sequence states
+                h, _ = self.recurrent_layer.forward_sequence(h, state=recurrent_cell)
             else: # GRU or LSTM
                 # These layers handle batch_first=True and initial hidden states correctly.
                 h, recurrent_cell = self.recurrent_layer(h, recurrent_cell)

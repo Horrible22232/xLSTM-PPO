@@ -4,6 +4,7 @@ import pickle
 import torch
 import time
 from torch import optim
+from torch.cuda.amp import GradScaler, autocast
 from buffer import Buffer
 from model import ActorCriticModel
 from worker import Worker
@@ -30,6 +31,17 @@ class PPOTrainer:
         self.lr_schedule = config["learning_rate_schedule"]
         self.beta_schedule = config["beta_schedule"]
         self.cr_schedule = config["clip_range_schedule"]
+
+        # Performance knobs
+        self.use_amp = self.device.type == "cuda"
+        self.scaler = GradScaler(enabled=self.use_amp)
+        if self.device.type == "cuda":
+            try:
+                torch.backends.cudnn.benchmark = True
+                if hasattr(torch, "set_float32_matmul_precision"):
+                    torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
 
         # Setup Tensorboard Summary Writer
         if not os.path.exists("./summaries"):
@@ -138,8 +150,10 @@ class PPOTrainer:
         for t in range(self.config["worker_steps"]):
             # Gradients can be omitted for sampling training data
             with torch.no_grad():
+                # (debug prints removed)
                 # Save the initial observations and recurrent cell states
-                self.buffer.obs[:, t] = torch.tensor(self.obs)
+                # Avoid extra copies: use from_numpy for CPU buffer, as_tensor for model input
+                self.buffer.obs[:, t] = torch.from_numpy(self.obs)
                 if self.recurrence["layer_type"] == "gru":
                     self.buffer.hxs[:, t] = self.recurrent_cell.squeeze(0)
                 elif self.recurrence["layer_type"] == "lstm":
@@ -152,7 +166,8 @@ class PPOTrainer:
                     self.buffer.xlstm_states[:, t] = slstm_state.permute(1, 0, 2)
 
                 # Forward the model to retrieve the policy, the states' value and the recurrent cell states
-                policy, value, self.recurrent_cell = self.model(torch.tensor(self.obs), self.recurrent_cell, self.device)
+                obs_tensor = torch.as_tensor(self.obs, device=self.device)
+                policy, value, self.recurrent_cell = self.model(obs_tensor, self.recurrent_cell, self.device)
                 self.buffer.values[:, t] = value
 
                 # Sample actions from each individual policy branch
@@ -194,11 +209,9 @@ class PPOTrainer:
                                 block_state = self.recurrent_cell.get(block_key, {})
                                 new_block_state = hxs.get(block_key, {})  # hxs is a state dict returned for batch_size=1
                                 for state_key, tensor in list(block_state.items()):
-                                    # skip None states (e.g., conv_state when conv1d disabled)
                                     new_slice = new_block_state.get(state_key, None)
                                     if tensor is None or new_slice is None:
                                         continue
-                                    # tensor shape (num_states, B, H), new_slice shape (num_states, 1, H)
                                     updated = tensor.clone()
                                     updated[:, w : w + 1, :] = new_slice
                                     self.recurrent_cell[block_key][state_key] = updated
@@ -206,7 +219,8 @@ class PPOTrainer:
                 self.obs[w] = obs
                             
         # Calculate advantages
-        _, last_value, _ = self.model(torch.tensor(self.obs), self.recurrent_cell, self.device)
+        obs_tensor = torch.as_tensor(self.obs, device=self.device)
+        _, last_value, _ = self.model(obs_tensor, self.recurrent_cell, self.device)
         self.buffer.calc_advantages(last_value, self.config["gamma"], self.config["lamda"])
 
         return episode_infos
@@ -247,21 +261,18 @@ class PPOTrainer:
         elif self.recurrence["layer_type"] == "lstm":
             recurrent_cell = (samples["hxs"].unsqueeze(0), samples["cxs"].unsqueeze(0))
         elif self.recurrence["layer_type"] == "xlstm":
-            # converted above; leave placeholder for clarity
-            pass
-
-        # Forward model
-        # For xLSTM, we expect xlstm_states of shape (num_sequences, 4, H). Turn into list of dicts per sequence
-        if self.recurrence["layer_type"] == "xlstm":
+            # For xLSTM, we expect xlstm_states of shape (num_sequences, 4, H). Turn into list of dicts per sequence
             seq_states = []
             states_tensor = samples["xlstm_states"]  # (num_sequences, 4, H)
             num_sequences = states_tensor.shape[0]
             for i in range(num_sequences):
-                # expand to include batch dim=1: (4, 1, H)
-                slstm_state = states_tensor[i].unsqueeze(1)
+                slstm_state = states_tensor[i].unsqueeze(1)  # (4, 1, H)
                 seq_states.append({"block_0": {"slstm_state": slstm_state}})
             recurrent_cell = seq_states
-        policy, value, _ = self.model(samples["obs"], recurrent_cell, self.device, self.buffer.actual_sequence_length)
+
+        # Forward model with AMP where available
+        with autocast(enabled=self.use_amp):
+            policy, value, _ = self.model(samples["obs"], recurrent_cell, self.device, self.buffer.actual_sequence_length)
         
         loss_mask = samples["loss_mask"]
 
@@ -318,10 +329,17 @@ class PPOTrainer:
         # Compute gradients
         for pg in self.optimizer.param_groups:
             pg["lr"] = learning_rate
-        self.optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config["max_grad_norm"])
-        self.optimizer.step()
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.use_amp:
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config["max_grad_norm"])
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config["max_grad_norm"])
+            self.optimizer.step()
 
         return [policy_loss.cpu().data.numpy(),
                 vf_loss.cpu().data.numpy(),

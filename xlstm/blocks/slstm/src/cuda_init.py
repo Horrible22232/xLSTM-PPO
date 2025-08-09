@@ -13,12 +13,13 @@ from torch.utils.cpp_extension import load as _load
 
 LOGGER = logging.getLogger(__name__)
 
-print("[DEBUG] torch version:", torch.__version__)
-if hasattr(torch.utils.cpp_extension, 'include_paths'):
-    try:
-        print("[DEBUG] include_paths(cuda=True):", torch.utils.cpp_extension.include_paths(cuda=True))
-    except Exception as e:
-        print("[DEBUG] include_paths(cuda=True) Exception:", e)
+if os.environ.get('XLSTM_VERBOSE_CUDA', '0') == '1':
+    print("[DEBUG] torch version:", torch.__version__)
+    if hasattr(torch.utils.cpp_extension, 'include_paths'):
+        try:
+            print("[DEBUG] include_paths(cuda=True):", torch.utils.cpp_extension.include_paths(cuda=True))
+        except Exception as e:
+            print("[DEBUG] include_paths(cuda=True) Exception:", e)
 
 
 def defines_to_cflags(defines=Union[dict[str, Union[int, str]], Sequence[tuple[str, Union[str, int]]]]):
@@ -33,18 +34,21 @@ def defines_to_cflags(defines=Union[dict[str, Union[int, str]], Sequence[tuple[s
 
 curdir = os.path.dirname(__file__)
 
-# if torch.cuda.is_available():
-if False:
+# Try to auto-fill CUDA_LIB from torch installation if not explicitly provided
+try:
     from packaging import version
-
-    if version.parse(torch.__version__) >= version.parse("2.6.0"):
-        os.environ["CUDA_LIB"] = os.path.join(
-            os.path.split(torch.utils.cpp_extension.include_paths(device_type="cuda")[-1])[0], "lib"
-        )
-    else:
-        os.environ["CUDA_LIB"] = os.path.join(
-            os.path.split(torch.utils.cpp_extension.include_paths(cuda=True)[-1])[0], "lib"
-        )
+    if "CUDA_LIB" not in os.environ and torch.cuda.is_available():
+        if version.parse(torch.__version__) >= version.parse("2.6.0"):
+            os.environ["CUDA_LIB"] = os.path.join(
+                os.path.split(torch.utils.cpp_extension.include_paths(device_type="cuda")[-1])[0], "lib"
+            )
+        else:
+            os.environ["CUDA_LIB"] = os.path.join(
+                os.path.split(torch.utils.cpp_extension.include_paths(cuda=True)[-1])[0], "lib"
+            )
+except Exception as e:
+    if os.environ.get('XLSTM_VERBOSE_CUDA', '0') == '1':
+        print("[DEBUG] Failed to derive CUDA_LIB:", e)
 
 
 EXTRA_INCLUDE_PATHS = (
@@ -94,10 +98,20 @@ def load(*, name, sources, extra_cflags=(), extra_cuda_cflags=(), **kwargs):
         extra_cflags.append("-isystem")
         extra_cflags.append(eip)
 
+    # Determine arch for the active GPU to avoid mismatched code generation
+    arch_flag = None
+    try:
+        if torch.cuda.is_available():
+            maj, minu = torch.cuda.get_device_capability(0)
+            arch_flag = f"compute_{maj}{minu}"
+    except Exception as e:
+        if os.environ.get('XLSTM_VERBOSE_CUDA', '0') == '1':
+            print("[DEBUG] Could not determine device capability:", e)
+
     myargs = {
         "verbose": True,
         "with_cuda": True,
-        "extra_ldflags": [f"-L{os.environ['CUDA_LIB']}", "-lcublas"],
+        "extra_ldflags": ([f"-L{os.environ['CUDA_LIB']}"] if "CUDA_LIB" in os.environ else []) + ["-lcublas"],
         "extra_cflags": [*extra_cflags],
         "extra_cuda_cflags": [
             # "-gencode",
@@ -105,7 +119,7 @@ def load(*, name, sources, extra_cflags=(), extra_cuda_cflags=(), **kwargs):
             # "-dbg=1",
             '-Xptxas="-v"',
             "-gencode",
-            "arch=compute_80,code=compute_80",
+            f"arch={arch_flag if arch_flag else 'compute_80'},code={arch_flag if arch_flag else 'compute_80'}",
             "-res-usage",
             "--use_fast_math",
             "-O3",
@@ -115,7 +129,8 @@ def load(*, name, sources, extra_cflags=(), extra_cuda_cflags=(), **kwargs):
             *extra_cuda_cflags,
         ],
     }
-    print(myargs)
+    if os.environ.get('XLSTM_VERBOSE_CUDA', '0') == '1':
+        print(myargs)
     myargs.update(**kwargs)
     # add random waiting time to minimize deadlocks because of badly managed multicompile of pytorch ext
     time.sleep(random.random() * 10)

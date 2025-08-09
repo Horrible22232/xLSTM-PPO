@@ -777,7 +777,16 @@ class sLSTMCell(sLSTMCellBase):
 
     def __new__(cls, config: sLSTMCellConfig, skip_backend_init: bool = False):
         if config.backend == "cuda":
-            return sLSTMCell_cuda(config, skip_backend_init=skip_backend_init)
+            try:
+                return sLSTMCell_cuda(config, skip_backend_init=skip_backend_init)
+            except Exception as e:
+                LOGGER.warning(
+                    "sLSTM CUDA backend failed to load; falling back to vanilla. Error: %s",
+                    e,
+                )
+                # Fallback to vanilla PyTorch implementation (works on GPU tensors too)
+                config.backend = "vanilla"
+                return sLSTMCell_vanilla(config)
         elif config.backend == "vanilla":
             return sLSTMCell_vanilla(config)
         else:
